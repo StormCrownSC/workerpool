@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"log"
 	"sync"
@@ -10,22 +11,32 @@ import (
 	"github.com/junxed/workerpool/worker"
 )
 
-type pool struct {
+var (
+	ErrPoolClosed    = errors.New("worker pool is closed")
+	ErrAlreadyClosed = errors.New("worker pool already is closed")
+)
+
+type Pool struct {
 	workers      []*worker.Worker
+	nextID       atomic.Int64
 	scaleMutex   sync.Mutex
 	taskQueue    chan *worker.Task
-	workersCount *atomic.Int64
-	config       Config
-	queueLength  *atomic.Int64
-	busyWorkers  *atomic.Int64
+	workersCount atomic.Int64
+	queueLength  atomic.Int64
+	busyWorkers  atomic.Int64
 	isClosed     atomic.Bool
-	closeCh      chan struct{}
+	done         chan struct{}
+	closeOnce    sync.Once
+	workerWg     sync.WaitGroup
+	monitorWg    sync.WaitGroup
+	notify       chan struct{}
+	config       Config
 }
 
 type Config struct {
 	WorkersCount int64
 	QueueSize    int64
-	StopTimeout  time.Duration // default 5s
+	StopTimeout  time.Duration
 
 	ScalingConfig ScalingConfig
 }
@@ -34,184 +45,188 @@ type ScalingConfig struct {
 	Enable                      bool
 	MinWorkers                  int64
 	MaxWorkers                  int64
-	Type                        ScalingType   // default Queue
-	MaxLoadPercent              float64       // default 70%
-	MinLoadPercent              float64       // default 30%
-	WorkersToAddRatioPercent    float64       // default 20%
-	WorkersToRemoveRatioPercent float64       // default 10%
-	Interval                    time.Duration //default 1 second
+	Type                        ScalingType
+	MaxLoadPercent              float64
+	MinLoadPercent              float64
+	WorkersToAddRatioPercent    float64
+	WorkersToRemoveRatioPercent float64
+	Interval                    time.Duration
 
 	Logging Logging
 }
 
 type Logging struct {
-	Enable   bool          // debug log
-	Interval time.Duration // default 1 minute
+	Enable   bool
+	Interval time.Duration
 }
 
 type Pooler interface {
 	Submit(act func()) error
+	SubmitContext(ctx context.Context, act func()) error
 	SubmitWait(act func()) error
+	SubmitWaitContext(ctx context.Context, act func()) error
 	Stop() error
 	Wait()
 }
 
-func NewPool(params Config) (*pool, error) {
+func NewPool(params Config) (*Pool, error) {
 	var err error
 	if params, err = checkParams(params); err != nil {
 		return nil, err
 	}
 
-	pool := &pool{
-		taskQueue:    make(chan *worker.Task, params.QueueSize),
-		scaleMutex:   sync.Mutex{},
-		workersCount: &atomic.Int64{},
-		config:       params,
-		queueLength:  &atomic.Int64{},
-		busyWorkers:  &atomic.Int64{},
-		isClosed:     atomic.Bool{},
-		closeCh:      make(chan struct{}),
+	p := &Pool{
+		taskQueue: make(chan *worker.Task, params.QueueSize),
+		config:    params,
+		done:      make(chan struct{}),
+		notify:    make(chan struct{}, 1),
 	}
 
-	pool.scaleMutex.Lock()
-	pool.addWorker(params.WorkersCount)
-	pool.scaleMutex.Unlock()
-	if params.ScalingConfig.Logging.Enable {
-		go pool.monitorWorkers()
+	p.scaleMutex.Lock()
+	p.addWorker(params.WorkersCount)
+	p.scaleMutex.Unlock()
+
+	if params.ScalingConfig.Enable || params.ScalingConfig.Logging.Enable {
+		p.monitorWg.Add(1)
+		go p.monitorWorkers()
 	}
 
-	return pool, nil
+	return p, nil
 }
 
-func (pool *pool) Submit(act func()) error {
-	if pool.isClosed.Load() {
-		return errors.New("worker pool is closed")
+func (p *Pool) Submit(act func()) error {
+	return p.SubmitContext(context.Background(), act)
+}
+
+func (p *Pool) SubmitContext(ctx context.Context, act func()) error {
+	if p.isClosed.Load() {
+		return ErrPoolClosed
 	}
 
-	task := &worker.Task{
-		Action: act,
+	p.queueLength.Add(1)
+	task := &worker.Task{Action: act}
+	select {
+	case p.taskQueue <- task:
+		return nil
+	case <-ctx.Done():
+		p.queueLength.Add(-1)
+		return ctx.Err()
+	case <-p.done:
+		p.queueLength.Add(-1)
+		return ErrPoolClosed
+	}
+}
+
+func (p *Pool) SubmitWait(act func()) error {
+	return p.SubmitWaitContext(context.Background(), act)
+}
+
+func (p *Pool) SubmitWaitContext(ctx context.Context, act func()) error {
+	if p.isClosed.Load() {
+		return ErrPoolClosed
 	}
 
-	pool.taskQueue <- task
-	pool.queueLength.Add(1)
+	taskDone := make(chan struct{})
+	p.queueLength.Add(1)
+	task := &worker.Task{Action: act, Done: taskDone}
+
+	select {
+	case p.taskQueue <- task:
+	case <-ctx.Done():
+		p.queueLength.Add(-1)
+		return ctx.Err()
+	case <-p.done:
+		p.queueLength.Add(-1)
+		return ErrPoolClosed
+	}
+
+	select {
+	case <-taskDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.done:
+		return ErrPoolClosed
+	}
+}
+
+func (p *Pool) Wait() {
+	for {
+		if p.queueLength.Load() == 0 && p.busyWorkers.Load() == 0 {
+			return
+		}
+		select {
+		case <-p.notify:
+		case <-p.done:
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func (p *Pool) Stop() error {
+	if !p.isClosed.CompareAndSwap(false, true) {
+		return ErrAlreadyClosed
+	}
+
+	deadline := time.Now().Add(p.config.StopTimeout)
+	for time.Now().Before(deadline) {
+		if p.queueLength.Load() == 0 && p.busyWorkers.Load() == 0 {
+			break
+		}
+		select {
+		case <-p.notify:
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	p.closeOnce.Do(func() {
+		close(p.done)
+	})
+
+	p.scaleMutex.Lock()
+	for _, w := range p.workers {
+		w.Stop()
+	}
+	p.workers = nil
+	p.scaleMutex.Unlock()
+
+	p.workerWg.Wait()
+	p.monitorWg.Wait()
 
 	return nil
 }
 
-func (pool *pool) SubmitWait(act func()) error {
-	if pool.isClosed.Load() {
-		return errors.New("worker pool is closed")
+func (p *Pool) monitorWorkers() {
+	defer p.monitorWg.Done()
+
+	var scaleCh <-chan time.Time
+	if p.config.ScalingConfig.Enable {
+		t := time.NewTicker(p.config.ScalingConfig.Interval)
+		defer t.Stop()
+		scaleCh = t.C
 	}
 
-	done := make(chan struct{})
-	task := &worker.Task{
-		Action: act,
-		Done:   &done,
+	var logCh <-chan time.Time
+	if p.config.ScalingConfig.Logging.Enable {
+		t := time.NewTicker(p.config.ScalingConfig.Logging.Interval)
+		defer t.Stop()
+		logCh = t.C
 	}
 
-	pool.queueLength.Add(1)
-	pool.taskQueue <- task
-
-	_, ok := <-done
-	if !ok {
-		return errors.New("worker pool is closed")
-	}
-
-	return nil
-}
-
-func (pool *pool) Wait() {
 	for {
-		if pool.queueLength.Load() == 0 && pool.workersCount.Load() == 0 {
+		select {
+		case <-p.done:
 			return
-		}
-		time.Sleep(100 * time.Microsecond)
-	}
-}
-
-func (pool *pool) Stop() error {
-	if !pool.isClosed.CompareAndSwap(false, true) {
-		return errors.New("worker pool already is closed")
-	}
-
-	timeout := time.After(pool.config.StopTimeout)
-	if pool.config.ScalingConfig.Logging.Enable {
-		if pool.config.ScalingConfig.Logging.Enable {
-			select {
-			case pool.closeCh <- struct{}{}:
-			default:
-			}
-		}
-	}
-
-	for {
-		select {
-		case <-timeout:
-			pool.scaleMutex.Lock()
-			pool.removeWorker(pool.workersCount.Load())
-			pool.scaleMutex.Unlock()
-			close(pool.taskQueue)
-			return nil
-		default:
-			if pool.queueLength.Load() == 0 {
-				goto stopWorkers
-			}
-			time.Sleep(100 * time.Microsecond)
-		}
-	}
-
-stopWorkers:
-	pool.scaleMutex.Lock()
-	pool.removeWorker(pool.workersCount.Load())
-	pool.scaleMutex.Unlock()
-
-	for {
-		select {
-		case <-timeout:
-			close(pool.taskQueue)
-			return nil
-		default:
-			if pool.workersCount.Load() == 0 {
-				close(pool.taskQueue)
-				return nil
-			}
-			time.Sleep(100 * time.Microsecond)
+		case <-scaleCh:
+			p.checkScaling()
+		case <-logCh:
+			p.logging()
 		}
 	}
 }
 
-func (pool *pool) monitorWorkers() {
-	monitorTicker := time.NewTicker(pool.config.ScalingConfig.Interval)
-	defer monitorTicker.Stop()
-
-	var logTicker *time.Ticker
-	var logChannel <-chan time.Time
-
-	if pool.config.ScalingConfig.Logging.Enable {
-		logTicker = time.NewTicker(pool.config.ScalingConfig.Logging.Interval)
-		defer logTicker.Stop()
-		logChannel = logTicker.C
-	}
-
-	for {
-		select {
-		case <-monitorTicker.C:
-			if err := pool.checkScaling(); err != nil {
-				log.Printf("Logging error: %v", err)
-				return
-			}
-
-		case <-logChannel:
-			pool.logging()
-
-		case <-pool.closeCh:
-			return
-		}
-		time.Sleep(100 * time.Microsecond)
-	}
-}
-
-func (p *pool) logging() {
+func (p *Pool) logging() {
 	wTotal := p.workersCount.Load()
 	wBusy := p.busyWorkers.Load()
 	qLen := p.queueLength.Load()
@@ -229,82 +244,82 @@ func (p *pool) logging() {
 		qLen, qCap, safeDiv(qLen, qCap),
 	)
 }
-func (p *pool) checkScaling() error {
+
+func (p *Pool) checkScaling() {
 	p.scaleMutex.Lock()
 	defer p.scaleMutex.Unlock()
 
-	currentWorkers := p.workersCount.Load()
-	currentQueue := p.queueLength.Load()
-	currentBusy := p.busyWorkers.Load()
-
-	if currentWorkers == 0 {
-		return nil
-	}
-
-	var currentLoad float64
-	switch p.config.ScalingConfig.Type {
-	case ScalingTypeQueue:
-		currentLoad = float64(currentQueue) / float64(p.config.QueueSize)
-	case ScalingTypeWorker:
-		currentLoad = float64(currentBusy) / float64(currentWorkers)
-	default:
-		currentLoad = float64(currentQueue) / float64(p.config.QueueSize)
-	}
-
-	cfg := p.config.ScalingConfig
-
-	if currentLoad > cfg.MaxLoadPercent && currentWorkers < cfg.MaxWorkers {
-		p.scaleUp(currentWorkers)
-		return nil
-	}
-
-	if currentLoad < cfg.MinLoadPercent && currentWorkers > cfg.MinWorkers {
-		p.scaleDown(currentWorkers)
-	}
-
-	return nil
-}
-func (pool *pool) scaleUp(currentWorkers int64) {
-	workersToAdd := int64(float64(currentWorkers) * pool.config.ScalingConfig.WorkersToAddRatioPercent)
-	if workersToAdd < 1 {
-		workersToAdd = 1
-	}
-
-	if currentWorkers+workersToAdd > pool.config.ScalingConfig.MaxWorkers {
-		workersToAdd = pool.config.ScalingConfig.MaxWorkers - currentWorkers
-	}
-
-	pool.addWorker(workersToAdd)
-}
-
-func (pool *pool) scaleDown(currentWorkers int64) {
-	workersToRemove := int64(float64(currentWorkers) * pool.config.ScalingConfig.WorkersToRemoveRatioPercent)
-	if workersToRemove < 1 {
-		workersToRemove = 1
-	}
-
-	if currentWorkers-workersToRemove < pool.config.ScalingConfig.MinWorkers {
-		workersToRemove = currentWorkers - pool.config.ScalingConfig.MinWorkers
-	}
-	pool.removeWorker(workersToRemove)
-}
-
-func (pool *pool) addWorker(workersCount int64) {
-	if pool.isClosed.Load() {
+	cw := p.workersCount.Load()
+	if cw == 0 {
 		return
 	}
 
-	var actualWorkers = pool.workersCount.Load()
-	for index := actualWorkers; index < workersCount+actualWorkers; index++ {
-		newWorker := worker.NewWorker(index, pool.taskQueue, pool.queueLength, pool.busyWorkers, pool.workersCount)
-		pool.workers = append(pool.workers, newWorker)
-		newWorker.Start()
+	cfg := p.config.ScalingConfig
+	var load float64
+	switch cfg.Type {
+	case ScalingTypeWorker:
+		load = float64(p.busyWorkers.Load()) / float64(cw)
+	default:
+		load = float64(p.queueLength.Load()) / float64(p.config.QueueSize)
+	}
+
+	if load > cfg.MaxLoadPercent && cw < cfg.MaxWorkers {
+		p.scaleUp(cw)
+		return
+	}
+	if load < cfg.MinLoadPercent && cw > cfg.MinWorkers {
+		p.scaleDown(cw)
 	}
 }
 
-func (pool *pool) removeWorker(workersCount int64) {
-	for i := range workersCount {
-		pool.workers[i].Stop()
+func (p *Pool) scaleUp(currentWorkers int64) {
+	cfg := p.config.ScalingConfig
+	workersToAdd := max(int64(float64(currentWorkers)*cfg.WorkersToAddRatioPercent), 1)
+	if currentWorkers+workersToAdd > cfg.MaxWorkers {
+		workersToAdd = cfg.MaxWorkers - currentWorkers
 	}
-	pool.workers = pool.workers[workersCount:]
+	p.addWorker(workersToAdd)
+}
+
+func (p *Pool) scaleDown(currentWorkers int64) {
+	cfg := p.config.ScalingConfig
+	workersToRemove := max(int64(float64(currentWorkers)*cfg.WorkersToRemoveRatioPercent), 1)
+	if currentWorkers-workersToRemove < cfg.MinWorkers {
+		workersToRemove = currentWorkers - cfg.MinWorkers
+	}
+	p.removeWorker(workersToRemove)
+}
+
+func (p *Pool) addWorker(count int64) {
+	if p.isClosed.Load() {
+		return
+	}
+	for range count {
+		id := p.nextID.Add(1)
+		w := worker.NewWorker(
+			id,
+			p.taskQueue,
+			p.done,
+			&p.queueLength,
+			&p.busyWorkers,
+			&p.workersCount,
+			&p.workerWg,
+			p.notify,
+		)
+		p.workers = append(p.workers, w)
+		w.Start()
+	}
+}
+
+func (p *Pool) removeWorker(count int64) {
+	if count <= 0 {
+		return
+	}
+	if count > int64(len(p.workers)) {
+		count = int64(len(p.workers))
+	}
+	for i := range count {
+		p.workers[i].Stop()
+	}
+	p.workers = p.workers[count:]
 }
